@@ -1,0 +1,358 @@
+.include "tn85def.inc"
+
+;; Fuses (low byte): 11100001
+
+;; Defines
+;; --------------------------------------------------------
+
+    ; Register vars
+    ;
+    ; r0 to r6      - general purpose
+    ; r7 (zero)     - always 0
+    ; r8 to r23     * free to use
+    ; r24 (cnt)     - general purpose counter
+    ; r25 (temp)    - temp I/O register
+    ; X, Y, Z       - general purpose pointers
+    ;
+    ch_cnt  = 19
+    ;
+    send    = 20
+    cap_3   = 21
+    cap_4   = 22
+    chan    = 23
+
+    zero    = 7         ; always 0
+    cnt     = 24        ; a counter
+    temp    = 25        ; temp I/O register
+
+    ; Arrays and sizes
+    ;
+    arr_sz    = 64      ; power of 2; max 128; running average
+    ;                   ; array in RAM, there are 2 of them
+    pre_avg_n = 32      ; power of 2; max 256; number of samples
+    ;                   ; for averaging before adding to the array
+    ;
+    struct_sz    = 8    ; see `average` function
+
+
+;; RAM vars
+;; --------------------------------------------------------
+
+    .comm   struct_n, struct_sz * 2
+    .comm   arr_n,    arr_sz * 2
+
+
+;; Macros
+;; --------------------------------------------------------
+
+    .macro outi reg, val
+        ldi     temp, \val
+        out     \reg, temp
+    .endm
+
+    .macro shift_avg  n, avg_h, avg_l
+        ; Result in `temp`
+        ; max 7 clocks
+        ;
+        .if \n == 16
+            ldi     temp,   0xf0
+            and     \avg_l, temp
+            mov     temp,   \avg_h
+            or      temp,   \avg_l
+            swap    temp
+        .elseif \n > 16
+            .if \n < 256
+                lsl \avg_l  $ rol \avg_h
+            .endif
+            .if \n < 128
+                lsl \avg_l  $ rol \avg_h
+            .endif
+            .if \n < 64
+                lsl \avg_l  $ rol \avg_h
+            .endif
+            mov     temp,   \avg_h
+        .else
+            .if \n > 0
+                lsr \avg_h  $ ror \avg_l
+            .endif
+            .if \n > 2
+                lsr \avg_h  $ ror \avg_l
+            .endif
+            .if \n > 4
+                lsr \avg_h  $ ror \avg_l
+            .endif
+            mov     temp,   \avg_l
+        .endif
+    .endm
+
+
+;; Interrupt vectors
+;; --------------------------------------------------------
+
+.org 0x00 * 2
+    rjmp    reset
+.org 0x0a * 2
+    rjmp    tim0_compa_isr
+.org 0x0b * 2
+    rjmp    tim0_compb_isr
+.org 0x0e * 2
+    rjmp    usi_ovf_isr
+
+
+;; Interrupt routines
+;; --------------------------------------------------------
+
+tim0_compa_isr:
+    ; Negative pulse start
+    cbi     PORTB,  PB0
+    in      temp,   ADCH
+    rcall average
+    reti
+
+tim0_compb_isr:
+    ; Negative pulse end
+    sbi     PORTB,  PB0
+    rcall adc_switch_chan
+    reti
+
+usi_ovf_isr:
+    sbi     USISR,  USIOIF
+    ;in      temp,   USIDR           ; read
+    com     send
+    brne 1f
+        out     USIDR,  cap_3
+        reti
+    1:
+        out     USIDR,  cap_4
+        reti
+
+
+;; Init
+;; --------------------------------------------------------
+
+reset:
+    ; Clock setup
+    ;
+    outi    CLKPR,  (1<<CLKPCE)
+    outi    CLKPR,  CLKPS   ; CLKPS defined below
+
+    ; Registers & memory
+    ;
+    rcall clear_sram
+    clr     zero
+    clr     send
+    clr     chan
+    clr     ch_cnt
+
+    ; Pins:
+    ;   PB0 - (out)     discharge pulse
+    ;   PB1 - (out)     MISO
+    ;   PB2 - (in)      SCK
+    ;   PB3 - (in/out)  diff analog input, pulled up (in) / high (out)
+    ;   PB4 - (in/out)  diff analog input, pulled up (in) / high (out)
+    ;
+    ; Digital input disabled on PB3 & PB4.
+    ;
+    DDRB_CFG = (1<<PB0) | (1<<PB1)
+    ;
+    outi    DDRB,   DDRB_CFG
+    outi    PORTB,  (1<<PB0) | (1<<PB3) | (1<<PB4)
+    outi    DIDR0,  (1<<ADC2D) | (1<<ADC3D)
+
+    ; SPI
+    ;
+    outi    USICR,  (1<<USIOIE) | (1<<USIWM0) | (1<<USICS1)
+
+    ; T0 - ADC clock variants, MHz:
+    ;
+    ; F_CPU     | F_ADC | F_T0  | T0A   | Comment
+    ; ----------|-------|-------|-------|------------------
+    ; 8         | 2     | 8     | 4     | - (not tested)
+    ; 8         | 1     | 8     | 8     | too fast
+    ; 8         | 0.500 | 8     | 16    | low sensitivity
+    ; 8         | 0.250 | 1     | 4     | almost zero sens
+    ; 8         | 0.125 | 1     | 8     | good
+    ; 8         | 0.062 | 1     | 16    | almost zero sens
+    ;
+    ; 16        | 4     | 16    | 4     | -
+    ; 16        | 2     | 16    | 8     | too fast (but good)
+    ; 16        | 1     | 16    | 16    * good (current)
+    ; 16        | 0.500 | 2     | 4     | low sensitivity
+    ; 16        | 0.250 | 2     | 8     | good
+    ; 16        | 0.125 | 2     | 16    | low sensitivity
+    ;
+    CLKPS = 0   ; F_CPU = 16 / 2^CLKPS
+    ADPS  = 4   ; F_ADC = F_CPU / 2^(ADPS or 1)
+    T0CS  = 1   ; F_T0  = [1]:F_CPU; [2]:F_CPU/8
+    ;           ; T0PS  = [1]:1;     [2]:8
+    ;
+    T0A   = 16  ; T0 clocks per 1 ADC clock [4, 8, 16]
+    ;
+    ; Timer 0 (in sync with Free running ADC)
+    ;   Timing is critical. ADC starts first conversion with
+    ;   some delay + 12 clocks after ADSC has been written.
+    ;   Then actual 13-clock conversion is started: sampling
+    ;   lags 1.5 ADC clocks and lasts same 1.5 clocks.
+    ;   Then go 11 clocks of approximation, after which the
+    ;   13-clock conversion is repeated continuously.
+    ;
+    ;   TCNT0 initial value then calculated as:
+    ;     PERIOD - ADC_CLOCK/2 - ADC_START_DELAY,
+    ;   which, converting to ADC clocks gives:
+    ;       13 - 0.5 - X
+    ;   X=0.25 performs best.
+    ;
+    T0_PERIOD   = T0A * 13
+    PULSE_WIDTH = T0A * 3/2  * 2
+    T0_INIT     = T0_PERIOD - T0A*1/2 - T0A*1/4
+    ;
+    outi    OCR0A,  T0_PERIOD - 1
+    outi    OCR0B,  PULSE_WIDTH
+    outi    TCNT0,  T0_INIT
+    outi    TCCR0A, (1<<WGM01)  ; CTC
+    outi    TIMSK,  (1<<OCIE0A) | (1<<OCIE0B)
+
+    ; ADC
+    ;   Free running, differential PB4-PB3
+    ;   Vref = 1.1V
+    ;
+    X20 = 1 ; x20 gain
+    ;
+    outi    ADMUX,  6 | X20 | (1<<REFS1) | (1<<ADLAR)
+    outi    ADCSRA, (1<<ADEN) | (1<<ADSC) | (1<<ADATE) | ADPS
+
+    ; Start Timer 0
+    ;
+    outi    TCCR0B, T0CS
+
+    sei
+
+
+;; Maint loop
+;; --------------------------------------------------------
+
+main:
+    rjmp main
+
+
+;; Functions
+;; --------------------------------------------------------
+
+clear_sram:
+    ldi     XL, lo8(SRAM_START)
+    ldi     XH, hi8(SRAM_START)
+    ldi     YL, lo8(SRAM_SIZE-2)
+    ldi     YH, hi8(SRAM_SIZE-2)
+    clr     r0
+    1:
+        st      X+, r0
+        sbiw    Y,  1
+        brne 1b
+    ret
+
+adc_switch_chan:
+    ; `ch_cnt` is for slowing down polarity switch; without
+    ; slowdown, it doesn't switch at all; polarity must
+    ; stay the same for at least 0.5 millisecond.
+    ;
+    inc     ch_cnt
+    brne 2f
+        com     chan
+        brne 1f
+            ; to measure capacity on PB3
+            outi    DDRB,   DDRB_CFG | (1<<PB4)
+            cbi     ADCSRB, IPR     ; IPR=0: PB4(+), PB3(-)
+            rjmp 2f
+        1:
+            ; to measure capacity on PB4
+            outi    DDRB,   DDRB_CFG | (1<<PB3)
+            sbi     ADCSRB, IPR     ; IPR=1: PB4(-), PB3(+)
+    2:
+    ret
+
+average:
+    ; `temp` - val to add
+    ; return values in `cap_3` and `cap_4`
+    ;
+    ; The Structure:
+    ;   [0] n_sum low
+    ;   [1] n_sum high
+    ;   [2] n   (0..pre_avg_n-1)
+    ;   [3] a_sum low
+    ;   [4] a_sum high
+    ;   [5] a_i (0..arr_sz-1)
+    ;
+    ldi     ZL, lo8(struct_n)
+    ldi     ZH, hi8(struct_n)
+    sbrc    chan,   0
+        adiw    Z,  struct_sz
+
+    ldd     r0, Z+0     ; < n_sum low
+    ldd     r1, Z+1     ; < n_sum high
+    ldd     cnt, Z+2    ; < n
+
+    add     r0, temp    ; + ADC value   !
+    adc     r1, zero
+    inc     cnt
+    cpi     cnt,    lo8(pre_avg_n)
+    brne 3f
+
+        shift_avg   pre_avg_n, r1, r0
+        ; `temp` now holds preliminarily averaged byte
+
+        add_to_array:
+                ; `Z` points to a structure
+                ; `Y` points to an array
+                ; `X` points to a `cap_*` register var
+                ;
+                clr     XH
+                tst     chan
+                brne 1f
+                    ldi     XL, cap_3
+                    ldi     YL, lo8(arr_n)
+                    ldi     YH, hi8(arr_n)
+                    rjmp 2f
+                1:
+                    ldi     XL, cap_4
+                    ldi     YL, lo8(arr_n + arr_sz)
+                    ldi     YH, hi8(arr_n + arr_sz)
+                2:
+                ldd     r0, Z+3         ; < a_sum low
+                ldd     r1, Z+4         ; < a_sum high
+                ldd     cnt, Z+5        ; < a_i
+
+                add     YL, cnt         ; arr_n + a_i
+                adc     YH, zero        ;
+
+                inc     cnt
+                andi    cnt, arr_sz-1
+
+                add     r0, temp        ; a_sum += temp     !
+                adc     r1, zero
+                ld      r2, Y
+                sub     r0, r2          ; a_sum -= arr_n[a_i]
+                sbc     r1, zero
+                st      Y,  temp        ; arr_n[a_i] = temp
+
+                std     Z+3, r0         ; > a_sum low
+                std     Z+4, r1         ; > a_sum high
+                std     Z+5, cnt        ; > a_i
+
+                shift_avg   arr_sz, r1, r0
+                ; `temp` now holds fully averaged byte
+
+                st      X,  temp        ; result to `cap_*` register var
+
+        ; clear n_sum & n
+        clr     r0
+        clr     r1
+        clr     cnt
+
+    3:
+    std     Z+0, r0     ; > n_sum low
+    std     Z+1, r1     ; > n_sum high
+    std     Z+2, cnt    ; > n
+
+    ret
+
+.end

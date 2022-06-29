@@ -1,0 +1,734 @@
+.include "tn85def.inc"
+
+
+;; Config
+;; --------------------------------------------------------
+
+    ; Fuses (low byte): 11100001
+
+    ; Calibration byte
+    ;   With current tone tables (chromatic and diatonic),
+    ;   to tune to standard A4=440 Hz CPU should run at
+    ;   roughly 13.9 MHz. Set to 0 to load a default
+    ;   calibration byte.
+    ;
+    calibration_val = 66
+
+    ; Sense pins config:
+    ;   0   - volume on PB3, frequency on PB4
+    ;   1   - volume on PB4, frequency on PB3
+    ;
+    sense_pins_cfg = 0
+    ;
+    ; Other pins
+    ;   PB0 - discharge pulse (not configurable)
+    ;   PB1 - PWM output for speaker (not configurable)
+    ;
+
+    ; Tone quantization:
+    ;   0   - none (raw full range)
+    ;   1   - poorly linearized (reduced range)
+    ;   2   - chromatic scale; 3 octaves
+    ;   3   - diatonic C-major scale; 3 octaves
+    ;
+    tone_quant = 0
+
+    ; Samples to average
+    ;   Total samples to average = `arr_sz * pre_avg_n`.
+    ;
+    arr_sz    = 64      ; power of 2; max 128; running average
+    ;                   ; array in RAM, there are 2 of them
+    pre_avg_n = 32      ; power of 2; max 256; number of samples
+    ;                   ; for averaging before adding to the array
+
+    ; T0 - ADC clock variants, MHz:
+    ;
+    ; F_CPU     | F_ADC | F_T0  | T0A   | Comment
+    ; ----------|-------|-------|-------|------------------
+    ; 8         | 2     | 8     | 4     | - (not tested)
+    ; 8         | 1     | 8     | 8     | too fast
+    ; 8         | 0.500 | 8     | 16    | low sensitivity
+    ; 8         | 0.250 | 1     | 4     | almost zero sens
+    ; 8         | 0.125 | 1     | 8     | good
+    ; 8         | 0.062 | 1     | 16    | almost zero sens
+    ;
+    ; 16        | 4     | 16    | 4     | -
+    ; 16        | 2     | 16    | 8     | too fast (but good)
+    ; 16        | 1     | 16    | 16    * good (current)
+    ; 16        | 0.500 | 2     | 4     | low sensitivity
+    ; 16        | 0.250 | 2     | 8     | good
+    ; 16        | 0.125 | 2     | 16    | low sensitivity
+    ;
+    CLKPS = 0   ; F_CPU = 16 / 2^CLKPS
+    ADPS  = 4   ; F_ADC = F_CPU / 2^(ADPS or 1)
+    T0CS  = 1   ; F_T0  = [1]:F_CPU; [2]:F_CPU/8
+    ;           ; T0PS  = [1]:1;     [2]:8
+    ;
+    T0A   = 16  ; T0 clocks per 1 ADC clock [4, 8, 16]
+    ;
+    ; If clocks have been reconfigured pulse width
+    ; must be adjusted accordingly; see `tim0_compa_isr`.
+    ;
+    ; Poor sensitivity with certain clock configs my be
+    ; due to Timer-ADC are out of sync.
+
+
+;; Defines
+;; --------------------------------------------------------
+
+    ; Register vars
+    ;
+    ; r0 to r6      - general purpose
+    ; r7 (zero)     - always 0
+    ; r8 to r23     * free to use
+    ; r24 (cnt)     - general purpose counter
+    ; r25 (temp)    - temp I/O register
+    ; X, Y, Z       - general purpose pointers
+    ;
+    sinp_l  = 16        ; wave sample pointer
+    sinp_h  = 17        ;
+    sign    = 18        ; half-wave polarity
+    phs_cnt = 19
+    ;
+    cap_3   = 20        ; PB3 capacitance
+    cap_4   = 21        ; PB4 capacitance
+    chan    = 22        ; channel selected: 0=PB3, 1=PB4
+    ch_cnt  = 23
+    ;
+    zero    = 7         ; always 0
+    cnt     = 24        ; general purpose counter
+    temp    = 25        ; temp I/O register
+
+    .if sense_pins_cfg == 0
+        cap_vol = cap_3
+        cap_frq = cap_4
+    .else
+        cap_vol = cap_4
+        cap_frq = cap_3
+    .endif
+
+    ; Struct size (see `average` function)
+    ;
+    struct_sz = 8
+
+
+;; RAM vars
+;; --------------------------------------------------------
+
+    .comm   struct_n, struct_sz * 2
+    .comm   arr_n,    arr_sz * 2
+
+
+;; Macros
+;; --------------------------------------------------------
+
+    .macro outi  reg, val
+        ldi     temp, \val
+        out     \reg, temp
+    .endm
+
+    .macro shift_avg  n, avg_h, avg_l
+        ; Result in `temp`
+        ; max 7 clocks
+        ;
+        .if \n == 16
+            ldi     temp,   0xf0
+            and     \avg_l, temp
+            mov     temp,   \avg_h
+            or      temp,   \avg_l
+            swap    temp
+        .elseif \n > 16
+            .if \n < 256
+                lsl \avg_l  $ rol \avg_h
+            .endif
+            .if \n < 128
+                lsl \avg_l  $ rol \avg_h
+            .endif
+            .if \n < 64
+                lsl \avg_l  $ rol \avg_h
+            .endif
+            mov     temp,   \avg_h
+        .else
+            .if \n > 0
+                lsr \avg_h  $ ror \avg_l
+            .endif
+            .if \n > 2
+                lsr \avg_h  $ ror \avg_l
+            .endif
+            .if \n > 4
+                lsr \avg_h  $ ror \avg_l
+            .endif
+            mov     temp,   \avg_l
+        .endif
+    .endm
+
+    .macro nopnop n
+        .rept \n
+            nop
+        .endr
+    .endm
+
+;; Interrupt vectors
+;; --------------------------------------------------------
+
+.org 0x00 * 2
+    rjmp    reset
+.org 0x0a * 2
+    rjmp    tim0_compa_isr
+;.org 0x000b * 2
+;    rjmp    tim0_compb_isr
+
+
+;; Interrupt routines
+;; --------------------------------------------------------
+
+tim0_compa_isr:
+    ; ISR is executed each T0A*13*T0PS CPU clocks
+    ;
+    ; max 12 + 7 + (80-3) + 10 + (95-5) = 196 clocks
+    ;   ! must take less than T0A*13*T0PS clocks
+    ;
+
+    ; Discharge pulse + average ADC result
+    ;   ! pulse width must be >= 1.5 ADC clocks
+    ;
+        cbi     PORTB,  PB0         ; negative pulse start
+            in      temp,   ADCH
+            rjmp average                                        ; 80 - 3
+            tim0_compa_isr_average_ret:
+        sbi     PORTB,  PB0         ; negative pulse end
+
+    ; Switch channel and polarity                               ; 10
+    ;   `ch_cnt` is for slowing down polarity switch; without
+    ;   slowdown, it doesn't switch at all; polarity must
+    ;   stay the same for at least 0.5 millisecond.
+    ;
+        inc     ch_cnt
+        brne 2f
+            com     chan
+            brne 1f
+                ; to measure capacity on PB3
+                outi    DDRB,   DDRB_CFG | (1<<PB4)
+                cbi     ADCSRB, IPR     ; IPR=0: PB4(+), PB3(-)
+                rjmp 2f
+            1:
+                ; to measure capacity on PB4
+                outi    DDRB,   DDRB_CFG | (1<<PB3)
+                sbi     ADCSRB, IPR     ; IPR=1: PB4(-), PB3(+)
+        2:
+
+    ; Shift phase
+    ;
+        subi    phs_cnt,    64  ; each 4 periods
+        brne 1f
+            rjmp shift_phase    ; +reti                         ; 95 - 5
+        1:
+
+    reti
+
+;tim0_compb_isr:
+;    ; Negative pulse end
+;    sbi     PORTB,  PB0
+;    reti
+
+
+;; Init
+;; --------------------------------------------------------
+
+reset:
+    ; Clock setup
+    ;
+        .if calibration_val > 0
+            outi    OSCCAL, calibration_val
+        .endif
+        outi    CLKPR,  (1<<CLKPCE)
+        outi    CLKPR,  CLKPS
+
+    ; Registers & memory
+    ;
+        rcall clear_sram
+        clr     zero
+        ;
+        clr     chan
+        clr     ch_cnt
+        ;
+        clr     sinp_l
+        clr     sinp_h
+        clr     sign
+        clr     phs_cnt
+
+    ; Pins:
+    ;   PB0 - (out)     discharge pulse
+    ;   PB1 - (out)     PWM output
+    ;   PB3 - (in/out)  diff analog input, pulled up (in) / high (out)
+    ;   PB4 - (in/out)  diff analog input, pulled up (in) / high (out)
+    ;
+    ; Digital input disabled on PB3 & PB4.
+    ;
+        DDRB_CFG = (1<<PB0) | (1<<PB1)
+        ;
+        outi    DDRB,   DDRB_CFG
+        outi    PORTB,  (1<<PB0) | (1<<PB3) | (1<<PB4)
+        outi    DIDR0,  (1<<ADC2D) | (1<<ADC3D)
+
+    ; Timer 1, PWM (250 kHz)
+    ;
+        outi    PLLCSR, (1<<PCKE)
+        outi    TCCR1,  (1<<PWM1A) | (0b11<<COM1A0) | 1
+
+    ; Timer 0 (in sync with Free running ADC)
+    ;   We are bound to Timer 0 for ADC-synchronous discharge
+    ;   pulse generation as Timer 1 is used in high speed
+    ;   asynchronous mode for PWM generation.
+    ;
+    ;   Timing is critical. ADC starts first conversion with
+    ;   some delay + 12 clocks after ADSC has been written.
+    ;   Then actual 13-clock conversion is started: sampling
+    ;   lags 1.5 ADC clocks and lasts same 1.5 clocks.
+    ;   Then go 11 clocks of approximation, after which the
+    ;   13-clock conversion is repeated continuously.
+    ;
+    ;   TCNT0 initial value thus calculated as:
+    ;     PERIOD - ADC_CLOCK/2 - ADC_START_DELAY,
+    ;   which, converting to ADC clocks gives:
+    ;       13 - 0.5 - X
+    ;   X=0.25 performs best.
+    ;
+        T0_PERIOD   = T0A * 13
+        PULSE_WIDTH = T0A * 3/2
+        T0_INIT     = T0_PERIOD - T0A*1/2 - T0A*1/4
+        ;
+        outi    OCR0A,  T0_PERIOD - 1
+        outi    OCR0B,  PULSE_WIDTH
+        outi    TCNT0,  T0_INIT
+        outi    TCCR0A, (1<<WGM01)  ; CTC
+        outi    TIMSK,  (1<<OCIE0A) ;| (1<<OCIE0B)
+
+    ; ADC
+    ;   Free running, differential PB4-PB3
+    ;   Vref = 1.1V
+    ;
+        X20 = 1 ; x20 gain
+        ;
+        outi    ADMUX,  6 | X20 | (1<<REFS1) | (1<<ADLAR)
+        outi    ADCSRA, (1<<ADEN) | (1<<ADSC) | (1<<ADATE) | ADPS
+
+    ; Start Timer 0
+    ;
+        outi    TCCR0B, T0CS
+
+    sei
+
+
+;; Maint loop   :|
+;; --------------------------------------------------------
+
+    nopnop 5
+main:
+    nopnop 6
+    rjmp main
+
+
+;; Functions
+;; --------------------------------------------------------
+
+clear_sram:
+    ldi     XL, lo8(SRAM_START)
+    ldi     XH, hi8(SRAM_START)
+    ldi     YL, lo8(SRAM_SIZE-2)
+    ldi     YH, hi8(SRAM_SIZE-2)
+    clr     r0
+    1:
+        st      X+, r0
+        sbiw    Y,  1
+        brne 1b
+    ret
+
+average:
+    ; `temp` - val to add
+    ; return values in `cap_3` and `cap_4`
+    ;
+    ; max 25 + 7 + 41 + 7 = 80 clocks incl. call+return
+    ;
+    ; The Structure:
+    ;   [0] n_sum low
+    ;   [1] n_sum high
+    ;   [2] n   (0..pre_avg_n-1)
+    ;   [3] a_sum low
+    ;   [4] a_sum high
+    ;   [5] a_i (0..arr_sz-1)
+    ;
+    ldi     ZL, lo8(struct_n)
+    ldi     ZH, hi8(struct_n)
+    sbrc    chan,   0
+        adiw    Z,  struct_sz
+
+    ldd     r0, Z+0     ; < n_sum low
+    ldd     r1, Z+1     ; < n_sum high
+    ldd     cnt, Z+2    ; < n
+
+    add     r0, temp    ; + ADC value   !
+    adc     r1, zero
+    inc     cnt
+    cpi     cnt,    lo8(pre_avg_n)
+    brne 3f
+
+        shift_avg   pre_avg_n, r1, r0
+        ; `temp` now holds preliminarily averaged byte
+
+        add_to_array:
+                ; `Z` points to a structure
+                ; `Y` points to an array
+                ; `X` points to a `cap_*` register var
+                ;
+                ; max 34 + 7 = 41 clocks
+                ;
+                clr     XH
+                tst     chan
+                brne 1f
+                    ldi     XL, cap_3
+                    ldi     YL, lo8(arr_n)
+                    ldi     YH, hi8(arr_n)
+                    rjmp 2f
+                1:
+                    ldi     XL, cap_4
+                    ldi     YL, lo8(arr_n + arr_sz)
+                    ldi     YH, hi8(arr_n + arr_sz)
+                2:
+                ldd     r0, Z+3         ; < a_sum low
+                ldd     r1, Z+4         ; < a_sum high
+                ldd     cnt, Z+5        ; < a_i
+
+                add     YL, cnt         ; arr_n + a_i
+                adc     YH, zero        ;
+
+                inc     cnt
+                andi    cnt, arr_sz-1
+
+                add     r0, temp        ; a_sum += temp     !
+                adc     r1, zero
+                ld      r2, Y
+                sub     r0, r2          ; a_sum -= arr_n[a_i]
+                sbc     r1, zero
+                st      Y,  temp        ; arr_n[a_i] = temp
+
+                std     Z+3, r0         ; > a_sum low
+                std     Z+4, r1         ; > a_sum high
+                std     Z+5, cnt        ; > a_i
+
+                shift_avg   arr_sz, r1, r0
+                ; `temp` now holds fully averaged byte
+
+                st      X,  temp        ; result to `cap_*` register var
+
+        ; clear n_sum & n
+        clr     r0
+        clr     r1
+        clr     cnt
+
+    3:
+    std     Z+0, r0     ; > n_sum low
+    std     Z+1, r1     ; > n_sum high
+    std     Z+2, cnt    ; > n
+
+    ;ret
+    rjmp tim0_compa_isr_average_ret
+
+
+shift_phase:
+    ; max 38 + 50 + 7 = 95 clocks incl. call+return
+    ;
+    ; `adc ZH, zero` are commented out because tables
+    ; are aligned to 256-byte boundary.
+
+    ; Tone quantization
+    ;
+        .if tone_quant == 3 || tone_quant == 2
+            ldi     ZL,     lo8(tone_quant_table_256)
+            ldi     ZH,     hi8(tone_quant_table_256)
+            add     ZL,     cap_frq
+            ;adc     ZH,     zero
+            lpm     temp,   Z
+
+            .if tone_quant == 3
+            ; Diatonic scale
+                ldi     ZL,     lo8(diatonic_table_36)
+                ldi     ZH,     hi8(diatonic_table_36)
+            .else       ;  == 2
+            ; Chromatic scale
+                ldi     ZL,     lo8(chromatic_table_36)
+                ldi     ZH,     hi8(chromatic_table_36)
+            .endif
+
+            add     ZL,     temp
+            ;adc     ZH,     zero
+            lpm     temp,   Z
+
+        .elseif tone_quant == 1
+        ; Linearized
+            ldi     ZL,     lo8(corr_table_frq_256)
+            ldi     ZH,     hi8(corr_table_frq_256)
+            add     ZL,     cap_frq
+            ;adc     ZH,     zero
+            lpm     temp,   Z
+
+        .else
+        ; Raw full range
+            mov     temp,   cap_frq
+
+        .endif
+        ; `temp` now holds phase delta
+
+    ; Phase shift
+    ;
+        add     sinp_l, temp
+        adc     sinp_h, zero
+        sbrc    sinp_h, 3
+            com     sign
+        andi    sinp_h, hi8(2047)
+
+        tst     sign
+        brne 1f
+            ; First half wave, ascending
+            ldi     ZL,     lo8(sin_table_pi_2048)
+            ldi     ZH,     hi8(sin_table_pi_2048)
+            add     ZL,     sinp_l
+            adc     ZH,     sinp_h
+            lpm     XL,     Z
+            rjmp 2f
+        1:
+            ; Second half wave, descending (mirrored)
+            ldi     ZL,     lo8(sin_table_pi_2048 + 2047)
+            ldi     ZH,     hi8(sin_table_pi_2048 + 2047)
+            sub     ZL,     sinp_l
+            sbc     ZH,     sinp_h
+            lpm     XL,     Z
+            eor     XL,     sign
+        2:
+            ; XL now holds the sample
+
+    ; Volume adjust
+    ;
+        ldi     ZL,     lo8(corr_table_vol_256)
+        ldi     ZH,     hi8(corr_table_vol_256)
+        add     ZL,     cap_vol
+        ;adc     ZH,     zero
+        lpm     r0,     Z
+            ; r0 now holds the volume
+
+        ; Multiplication
+        ;   XL * r0 = temp:r1
+        ;   max 50 clocks  (`breq 2f`s are commented out)
+        ;
+            clr     XH
+            clr     r1
+            clr     temp
+
+                lsr r0  ;$ breq 2f
+                    brcc 1f     $ add r1, XL    $ adc temp, XH
+                    1:            lsl XL        $ rol XH
+                mov r2, r0  ; vol/2
+            .rept   6
+                lsr r0  ;$ breq 2f
+                    brcc 1f     $ add r1, XL    $ adc temp, XH
+                    1:            lsl XL        $ rol XH
+            .endr
+                lsr r0
+                2:  brcc 1f     $ add r1, XL    $ adc temp, XH
+                    1:
+
+        ; Shift DC
+        ;   r2 holds half the volume
+        ;   (set in Multiplication proc)
+        ;
+            ldi     XL,     127
+            sub     XL,     r2
+            add     temp,   XL
+
+    ; Adjust PWM
+    ;
+        out     OCR1A,  temp
+
+    ;ret
+    reti
+
+
+
+;; ROM data
+;; --------------------------------------------------------
+
+.align 8, 0xff
+
+    ; Сorrection and tone quantization tabels are heavily
+    ; depend on setup-specific hardware parameters such as
+    ; antenna configuration (length), MCU's stray capacitance
+    ; and pull-up resistor value which vary device to device.
+    ; Other things also take part: body conductivity,
+    ; mains EMI, humidity, temperature, etc.
+    ;
+    ; You should construct your own tables.
+    ;
+    ; Best approximation curve for y = ADCH(x) is bell-shape:
+    ;   y = exp((x^2 + a) / b) + c,
+    ; where
+    ;   x       - distance to antenna;
+    ;   a, b, c - curve parameters to find.
+    ;
+    ; See https://www.desmos.com/calculator/hyns7u46n6
+    ;
+
+corr_table_frq_256:
+    ; Correction table for frequency
+    ; (setup-specific)
+    ;
+    .byte      0,  37,  50,  58,  64,  69,  74,  77,  81,  84,  86,  89,  91,  93,  95,  97
+    .byte     99, 101, 102, 104, 105, 107, 108, 110, 111, 112, 113, 115, 116, 117, 118, 119
+    .byte    120, 121, 122, 123, 124, 125, 126, 127, 127, 128, 129, 130, 131, 132, 132, 133
+    .byte    134, 135, 135, 136, 137, 138, 138, 139, 140, 140, 141, 142, 142, 143, 144, 144
+    .byte    145, 146, 146, 147, 148, 148, 149, 149, 150, 150, 151, 152, 152, 153, 153, 154
+    .byte    154, 155, 156, 156, 157, 157, 158, 158, 159, 159, 160, 160, 161, 161, 162, 162
+    .byte    163, 163, 164, 164, 165, 165, 166, 166, 167, 167, 168, 168, 169, 169, 170, 170
+    .byte    171, 171, 172, 172, 172, 173, 173, 174, 174, 175, 175, 176, 176, 177, 177, 177
+    .byte    178, 178, 179, 179, 180, 180, 181, 181, 181, 182, 182, 183, 183, 184, 184, 185
+    .byte    185, 185, 186, 186, 187, 187, 188, 188, 189, 189, 189, 190, 190, 191, 191, 192
+    .byte    192, 192, 193, 193, 194, 194, 195, 195, 196, 196, 196, 197, 197, 198, 198, 199
+    .byte    199, 200, 200, 201, 201, 201, 202, 202, 203, 203, 204, 204, 205, 205, 206, 206
+    .byte    207, 207, 208, 208, 209, 209, 209, 210, 210, 211, 211, 212, 213, 213, 214, 214
+    .byte    215, 215, 216, 216, 217, 217, 218, 218, 219, 220, 220, 221, 221, 222, 223, 223
+    .byte    224, 224, 225, 226, 226, 227, 228, 229, 229, 230, 231, 232, 232, 233, 234, 235
+    .byte    236, 237, 238, 239, 240, 242, 243, 245, 247, 249, 255, 255, 255, 255, 255, 255
+
+corr_table_vol_256:
+    ; Correction table for volume
+    ; (setup-specific)
+    ;
+    .byte   255, 239, 235, 232, 229, 227, 225, 224, 222, 221, 219, 218, 217, 215, 214, 213
+    .byte   212, 211, 210, 209, 208, 207, 206, 205, 204, 203, 202, 201, 200, 199, 199, 198
+    .byte   197, 196, 195, 194, 193, 192, 192, 191, 190, 189, 188, 187, 187, 186, 185, 184
+    .byte   183, 182, 182, 181, 180, 179, 178, 177, 177, 176, 175, 174, 173, 172, 171, 171
+    .byte   170, 169, 168, 167, 166, 165, 165, 164, 163, 162, 161, 160, 159, 158, 157, 156
+    .byte   156, 155, 154, 153, 152, 151, 150, 149, 148, 147, 146, 145, 144, 143, 142, 141
+    .byte   140, 139, 138, 137, 136, 135, 134, 133, 131, 130, 129, 128, 127, 126, 125, 123
+    .byte   122, 121, 120, 119, 117, 116, 115, 114, 112, 111, 110, 108, 107, 106, 104, 103
+    .byte   101, 100,  98,  97,  95,  94,  92,  91,  89,  88,  86,  84,  83,  81,  79,  78
+    .byte    76,  74,  72,  70,  68,  66,  65,  63,  61,  58,  56,  54,  52,  50,  48,  45
+    .byte    43,  41,  38,  36,  33,  31,  28,  25,  23,  20,  17,  14,  11,   8,   5,   2
+    .byte     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
+    .byte     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
+    .byte     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
+    .byte     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
+    .byte     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
+
+tone_quant_table_256:
+    ; Tone quantization table
+    ; (setup-specific)
+    ;
+    .byte     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
+    .byte     1,   1,   1,   2,   2,   2,   3,   3,   3,   4,   4,   4,   4,   5,   5,   5
+    .byte     5,   6,   6,   6,   6,   6,   7,   7,   7,   7,   7,   8,   8,   8,   8,   8
+    .byte     8,   9,   9,   9,   9,   9,   9,  10,  10,  10,  10,  10,  10,  10,  11,  11
+    .byte    11,  11,  11,  11,  11,  12,  12,  12,  12,  12,  12,  12,  13,  13,  13,  13
+    .byte    13,  13,  13,  13,  14,  14,  14,  14,  14,  14,  14,  14,  14,  15,  15,  15
+    .byte    15,  15,  15,  15,  15,  15,  16,  16,  16,  16,  16,  16,  16,  16,  16,  17
+    .byte    17,  17,  17,  17,  17,  17,  17,  17,  17,  18,  18,  18,  18,  18,  18,  18
+    .byte    18,  18,  18,  19,  19,  19,  19,  19,  19,  19,  19,  19,  19,  20,  20,  20
+    .byte    20,  20,  20,  20,  20,  20,  20,  21,  21,  21,  21,  21,  21,  21,  21,  21
+    .byte    21,  22,  22,  22,  22,  22,  22,  22,  22,  22,  22,  23,  23,  23,  23,  23
+    .byte    23,  23,  23,  23,  23,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  25
+    .byte    25,  25,  25,  25,  25,  25,  25,  25,  26,  26,  26,  26,  26,  26,  26,  26
+    .byte    26,  27,  27,  27,  27,  27,  27,  27,  27,  28,  28,  28,  28,  28,  28,  28
+    .byte    29,  29,  29,  29,  29,  29,  29,  30,  30,  30,  30,  30,  30,  31,  31,  31
+    .byte    31,  31,  32,  32,  32,  33,  33,  33,  34,  34,  35,  35,  35,  35,  35,  35
+
+
+chromatic_table_36:
+    ; Chromatic scale table
+    ;
+    .byte    32,  34,  36,  38,  40,  43,  45,  48,  51,  54,  57,  61
+    .byte    64,  68,  72,  76,  81,  86,  91,  96, 102, 108, 114, 121
+    .byte   128, 136, 144, 153, 162, 171, 181, 192, 204, 216, 229, 242
+
+diatonic_table_36:
+    ; Diatonic scale table
+    ;
+    ; 2.5 octaves, linear
+    ;.byte    32,  32,  36,  36,  40,  40,  43,  43,  48,  48,  54,  54
+    ;.byte    61,  61,  64,  64,  72,  72,  81,  81,  86,  86,  96,  96
+    ;.byte   108, 108, 121, 121, 128, 128, 144, 144, 162, 162, 171, 171
+    ;
+    ; 3 octaves, non-linear
+    .byte    32,  36,  40,  43,  48,  54,  61,  61,  64,  64,  72,  72
+    .byte    81,  81,  86,  86,  96,  96, 108, 108, 121, 121, 128, 128
+    .byte   144, 144, 162, 162, 171, 171, 192, 192, 216, 216, 242, 242
+
+
+sin_table_pi_2048:
+    ; Half wave
+    ; (1st + 6th harmonics)
+    ;
+    .byte   127, 126, 126, 125, 125, 124, 124, 123, 123, 122, 122, 121, 121, 120, 120, 119, 119, 118, 118, 117, 117, 116, 116, 115, 115, 114, 114, 113, 113, 112, 112, 111
+    .byte   111, 110, 110, 109, 109, 108, 108, 107, 107, 106, 106, 105, 105, 104, 104, 103, 103, 102, 102, 101, 101, 100, 100,  99,  99,  98,  98,  97,  97,  97,  96,  96
+    .byte    95,  95,  94,  94,  93,  93,  92,  92,  92,  91,  91,  90,  90,  89,  89,  89,  88,  88,  87,  87,  87,  86,  86,  85,  85,  85,  84,  84,  83,  83,  83,  82
+    .byte    82,  81,  81,  81,  80,  80,  80,  79,  79,  79,  78,  78,  78,  77,  77,  77,  76,  76,  76,  75,  75,  75,  74,  74,  74,  73,  73,  73,  73,  72,  72,  72
+    .byte    71,  71,  71,  71,  70,  70,  70,  70,  69,  69,  69,  69,  68,  68,  68,  68,  67,  67,  67,  67,  67,  66,  66,  66,  66,  66,  65,  65,  65,  65,  65,  64
+    .byte    64,  64,  64,  64,  64,  64,  63,  63,  63,  63,  63,  63,  63,  62,  62,  62,  62,  62,  62,  62,  62,  62,  62,  61,  61,  61,  61,  61,  61,  61,  61,  61
+    .byte    61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61,  61
+    .byte    61,  61,  61,  61,  61,  61,  62,  62,  62,  62,  62,  62,  62,  62,  62,  62,  63,  63,  63,  63,  63,  63,  63,  63,  64,  64,  64,  64,  64,  64,  64,  65
+    .byte    65,  65,  65,  65,  65,  65,  66,  66,  66,  66,  66,  67,  67,  67,  67,  67,  67,  68,  68,  68,  68,  68,  69,  69,  69,  69,  70,  70,  70,  70,  70,  71
+    .byte    71,  71,  71,  72,  72,  72,  72,  72,  73,  73,  73,  73,  74,  74,  74,  74,  75,  75,  75,  75,  76,  76,  76,  76,  77,  77,  77,  78,  78,  78,  78,  79
+    .byte    79,  79,  79,  80,  80,  80,  80,  81,  81,  81,  82,  82,  82,  82,  83,  83,  83,  83,  84,  84,  84,  85,  85,  85,  85,  86,  86,  86,  87,  87,  87,  87
+    .byte    88,  88,  88,  88,  89,  89,  89,  90,  90,  90,  90,  91,  91,  91,  91,  92,  92,  92,  93,  93,  93,  93,  94,  94,  94,  94,  95,  95,  95,  95,  96,  96
+    .byte    96,  96,  97,  97,  97,  97,  98,  98,  98,  98,  99,  99,  99,  99, 100, 100, 100, 100, 100, 101, 101, 101, 101, 102, 102, 102, 102, 102, 103, 103, 103, 103
+    .byte   103, 104, 104, 104, 104, 104, 105, 105, 105, 105, 105, 105, 106, 106, 106, 106, 106, 106, 107, 107, 107, 107, 107, 107, 107, 108, 108, 108, 108, 108, 108, 108
+    .byte   108, 109, 109, 109, 109, 109, 109, 109, 109, 109, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 111, 111, 111, 111, 111
+    .byte   111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110
+    .byte   109, 109, 109, 109, 109, 109, 109, 109, 109, 108, 108, 108, 108, 108, 108, 108, 108, 107, 107, 107, 107, 107, 107, 106, 106, 106, 106, 106, 106, 105, 105, 105
+    .byte   105, 105, 104, 104, 104, 104, 104, 103, 103, 103, 103, 102, 102, 102, 102, 101, 101, 101, 101, 100, 100, 100, 100,  99,  99,  99,  98,  98,  98,  98,  97,  97
+    .byte    97,  96,  96,  96,  96,  95,  95,  95,  94,  94,  94,  93,  93,  93,  92,  92,  92,  91,  91,  91,  90,  90,  90,  89,  89,  88,  88,  88,  87,  87,  87,  86
+    .byte    86,  85,  85,  85,  84,  84,  84,  83,  83,  82,  82,  82,  81,  81,  80,  80,  80,  79,  79,  78,  78,  77,  77,  77,  76,  76,  75,  75,  75,  74,  74,  73
+    .byte    73,  72,  72,  72,  71,  71,  70,  70,  69,  69,  68,  68,  68,  67,  67,  66,  66,  65,  65,  64,  64,  64,  63,  63,  62,  62,  61,  61,  60,  60,  59,  59
+    .byte    59,  58,  58,  57,  57,  56,  56,  55,  55,  54,  54,  54,  53,  53,  52,  52,  51,  51,  50,  50,  49,  49,  49,  48,  48,  47,  47,  46,  46,  45,  45,  45
+    .byte    44,  44,  43,  43,  42,  42,  41,  41,  41,  40,  40,  39,  39,  38,  38,  38,  37,  37,  36,  36,  35,  35,  35,  34,  34,  33,  33,  33,  32,  32,  31,  31
+    .byte    31,  30,  30,  29,  29,  29,  28,  28,  27,  27,  27,  26,  26,  25,  25,  25,  24,  24,  24,  23,  23,  23,  22,  22,  22,  21,  21,  21,  20,  20,  19,  19
+    .byte    19,  19,  18,  18,  18,  17,  17,  17,  16,  16,  16,  15,  15,  15,  15,  14,  14,  14,  13,  13,  13,  13,  12,  12,  12,  12,  11,  11,  11,  11,  10,  10
+    .byte    10,  10,   9,   9,   9,   9,   9,   8,   8,   8,   8,   8,   7,   7,   7,   7,   7,   7,   6,   6,   6,   6,   6,   6,   5,   5,   5,   5,   5,   5,   5,   5
+    .byte     4,   4,   4,   4,   4,   4,   4,   4,   4,   4,   4,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3
+    .byte     3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   3,   4,   4,   4,   4,   4,   4,   4,   4,   4,   4,   4,   5,   5
+    .byte     5,   5,   5,   5,   5,   6,   6,   6,   6,   6,   6,   6,   7,   7,   7,   7,   7,   7,   8,   8,   8,   8,   8,   9,   9,   9,   9,   9,  10,  10,  10,  10
+    .byte    11,  11,  11,  11,  11,  12,  12,  12,  12,  13,  13,  13,  13,  14,  14,  14,  15,  15,  15,  15,  16,  16,  16,  17,  17,  17,  17,  18,  18,  18,  19,  19
+    .byte    19,  20,  20,  20,  20,  21,  21,  21,  22,  22,  22,  23,  23,  23,  24,  24,  24,  25,  25,  25,  26,  26,  27,  27,  27,  28,  28,  28,  29,  29,  29,  30
+    .byte    30,  31,  31,  31,  32,  32,  32,  33,  33,  33,  34,  34,  35,  35,  35,  36,  36,  37,  37,  37,  38,  38,  38,  39,  39,  40,  40,  40,  41,  41,  42,  42
+    .byte    42,  43,  43,  44,  44,  44,  45,  45,  45,  46,  46,  47,  47,  47,  48,  48,  49,  49,  49,  50,  50,  51,  51,  51,  52,  52,  52,  53,  53,  54,  54,  54
+    .byte    55,  55,  55,  56,  56,  57,  57,  57,  58,  58,  58,  59,  59,  60,  60,  60,  61,  61,  61,  62,  62,  62,  63,  63,  64,  64,  64,  65,  65,  65,  66,  66
+    .byte    66,  67,  67,  67,  68,  68,  68,  69,  69,  69,  70,  70,  70,  70,  71,  71,  71,  72,  72,  72,  73,  73,  73,  73,  74,  74,  74,  75,  75,  75,  75,  76
+    .byte    76,  76,  77,  77,  77,  77,  78,  78,  78,  78,  79,  79,  79,  79,  79,  80,  80,  80,  80,  81,  81,  81,  81,  81,  82,  82,  82,  82,  82,  83,  83,  83
+    .byte    83,  83,  83,  84,  84,  84,  84,  84,  84,  85,  85,  85,  85,  85,  85,  85,  85,  86,  86,  86,  86,  86,  86,  86,  86,  86,  87,  87,  87,  87,  87,  87
+    .byte    87,  87,  87,  87,  87,  87,  87,  87,  87,  87,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88,  88
+    .byte    87,  87,  87,  87,  87,  87,  87,  87,  87,  87,  87,  87,  87,  87,  87,  87,  86,  86,  86,  86,  86,  86,  86,  86,  86,  86,  85,  85,  85,  85,  85,  85
+    .byte    85,  84,  84,  84,  84,  84,  84,  84,  83,  83,  83,  83,  83,  83,  82,  82,  82,  82,  82,  81,  81,  81,  81,  81,  80,  80,  80,  80,  80,  79,  79,  79
+    .byte    79,  78,  78,  78,  78,  78,  77,  77,  77,  77,  76,  76,  76,  76,  75,  75,  75,  75,  74,  74,  74,  73,  73,  73,  73,  72,  72,  72,  72,  71,  71,  71
+    .byte    70,  70,  70,  70,  69,  69,  69,  68,  68,  68,  67,  67,  67,  67,  66,  66,  66,  65,  65,  65,  64,  64,  64,  63,  63,  63,  63,  62,  62,  62,  61,  61
+    .byte    61,  60,  60,  60,  59,  59,  59,  58,  58,  58,  57,  57,  57,  56,  56,  56,  55,  55,  55,  54,  54,  54,  53,  53,  53,  52,  52,  52,  52,  51,  51,  51
+    .byte    50,  50,  50,  49,  49,  49,  48,  48,  48,  47,  47,  47,  46,  46,  46,  45,  45,  45,  45,  44,  44,  44,  43,  43,  43,  42,  42,  42,  42,  41,  41,  41
+    .byte    40,  40,  40,  40,  39,  39,  39,  38,  38,  38,  38,  37,  37,  37,  37,  36,  36,  36,  35,  35,  35,  35,  34,  34,  34,  34,  34,  33,  33,  33,  33,  32
+    .byte    32,  32,  32,  31,  31,  31,  31,  31,  30,  30,  30,  30,  30,  29,  29,  29,  29,  29,  29,  28,  28,  28,  28,  28,  28,  27,  27,  27,  27,  27,  27,  26
+    .byte    26,  26,  26,  26,  26,  26,  26,  25,  25,  25,  25,  25,  25,  25,  25,  25,  25,  25,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24
+    .byte    24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  24,  25,  25,  25
+    .byte    25,  25,  25,  25,  25,  25,  25,  26,  26,  26,  26,  26,  26,  26,  26,  27,  27,  27,  27,  27,  27,  28,  28,  28,  28,  28,  28,  29,  29,  29,  29,  29
+    .byte    30,  30,  30,  30,  30,  31,  31,  31,  31,  32,  32,  32,  32,  33,  33,  33,  33,  34,  34,  34,  35,  35,  35,  35,  36,  36,  36,  37,  37,  37,  37,  38
+    .byte    38,  38,  39,  39,  39,  40,  40,  40,  41,  41,  41,  42,  42,  42,  43,  43,  44,  44,  44,  45,  45,  45,  46,  46,  47,  47,  47,  48,  48,  49,  49,  49
+    .byte    50,  50,  51,  51,  51,  52,  52,  53,  53,  53,  54,  54,  55,  55,  56,  56,  56,  57,  57,  58,  58,  59,  59,  60,  60,  61,  61,  61,  62,  62,  63,  63
+    .byte    64,  64,  65,  65,  66,  66,  67,  67,  68,  68,  69,  69,  69,  70,  70,  71,  71,  72,  72,  73,  73,  74,  74,  75,  75,  76,  76,  77,  77,  78,  78,  79
+    .byte    79,  80,  80,  81,  81,  82,  82,  83,  83,  84,  84,  85,  85,  86,  86,  87,  87,  88,  88,  89,  89,  90,  90,  91,  91,  92,  92,  93,  93,  94,  94,  95
+    .byte    95,  96,  96,  97,  97,  98,  98,  99,  99, 100, 100, 101, 101, 102, 102, 103, 103, 104, 104, 105, 105, 106, 106, 107, 107, 107, 108, 108, 109, 109, 110, 110
+    .byte   111, 111, 112, 112, 113, 113, 113, 114, 114, 115, 115, 116, 116, 117, 117, 117, 118, 118, 119, 119, 120, 120, 120, 121, 121, 122, 122, 123, 123, 123, 124, 124
+    .byte   125, 125, 125, 126, 126, 126, 127, 127, 128, 128, 128, 129, 129, 129, 130, 130, 131, 131, 131, 132, 132, 132, 133, 133, 133, 134, 134, 134, 135, 135, 135, 136
+    .byte   136, 136, 136, 137, 137, 137, 138, 138, 138, 138, 139, 139, 139, 140, 140, 140, 140, 141, 141, 141, 141, 142, 142, 142, 142, 142, 143, 143, 143, 143, 144, 144
+    .byte   144, 144, 144, 145, 145, 145, 145, 145, 145, 146, 146, 146, 146, 146, 146, 147, 147, 147, 147, 147, 147, 147, 148, 148, 148, 148, 148, 148, 148, 148, 148, 148
+    .byte   149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150
+    .byte   150, 150, 150, 150, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 149, 148, 148, 148, 148, 148, 148, 148, 148, 148, 148, 147
+    .byte   147, 147, 147, 147, 147, 147, 147, 146, 146, 146, 146, 146, 146, 146, 145, 145, 145, 145, 145, 145, 144, 144, 144, 144, 144, 144, 143, 143, 143, 143, 143, 142
+    .byte   142, 142, 142, 142, 141, 141, 141, 141, 141, 140, 140, 140, 140, 140, 139, 139, 139, 139, 138, 138, 138, 138, 138, 137, 137, 137, 137, 136, 136, 136, 136, 135
+    .byte   135, 135, 135, 134, 134, 134, 134, 133, 133, 133, 133, 132, 132, 132, 132, 131, 131, 131, 131, 130, 130, 130, 130, 129, 129, 129, 129, 128, 128, 128, 128, 127
+
+.end

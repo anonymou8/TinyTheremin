@@ -1,0 +1,97 @@
+<h1>A Tiny Theremin</h1>
+
+<p>This project was inspired by <a href="https://mitxela.com/projects/a_tiny_theremin">Tim&rsquo;s Tiny Theremin</a>.</p>
+
+<p>A tiny theremin with only one component — Atmel <strong>ATtiny85</strong> 8-bit microcontroller.</p>
+
+<p>To make the theremin you will need (at least):</p>
+
+<ul>
+<li>ATtiny85, ATtiny45 or similar microcontroller,</li>
+<li>three pieces of a wire: 2 for each antenna and another 1 for a &ldquo;wrist strap&rdquo;,</li>
+<li>some audio interface (e.g. a piezo element plus 100+ Ohm resistor),</li>
+</ul>
+
+
+<p>along with a 5 volts power source, facilities to flash the controller (AVR programmer)
+and a breadboard or some more wires plus soldering iron.</p>
+
+<p>Here&rsquo;s the connection diagram:</p>
+
+<p><img src="img/simple.png" style="width:100%; max-width:1200px;"></p>
+
+<p>For those, who are brave enough to hear me playing it
+(real guitar as an accompaniment plus some reverb):</p>
+
+<p><audio controls><source src="audio/ryabina.mp3" type="audio/mpeg"></audio></p>
+
+<p>Clean full range record:</p>
+
+<p><audio controls><source src="audio/clean.mp3" type="audio/mpeg"></audio></p>
+
+<h2>How it works</h2>
+
+<p>The principle is simple. Pin stray capacitance is getting charged to 5 volts over
+pin&rsquo;s pull-up resistor during non-sampling ADC period (most of the time). Then,
+in sync with sampling time, while pull-up resistor stays enabled, everything
+is getting discharged by a discharge pulse coming from other pin, directly connected
+to human body. The human-antenna capacitance determines discharge level of the stray
+capacitance.</p>
+
+<p>The more human-antenna capacitance (closer to antenna), the deeper stray capacitance
+gets discharged.</p>
+
+<p>Pull-up resistor decreases input impedance, which helps against mains EMI.</p>
+
+<p>Here&rsquo;s the schematic of a pin connected to the ADC peripherals:</p>
+
+<p><img src="img/pin.png" style="width:100%; max-width:1200px;"></p>
+
+<p>And here&rsquo;s the simulation of how voltage on the ADC&rsquo;s sample and hold
+capacitor behaves during dischage pulses, depending on the antenna capacitance.</p>
+
+<p><img src="img/voltage.png" style="width:100%; max-width:1200px;"></p>
+
+<p>Differential input mode of ADC, along with programmable gain, makes it really
+easy to measure tiny voltage changes, especially when internal 1.1V source
+is selected as a reference. But actual measurements are very noisy,
+considering their digital nature, so they are highly filtered (averaged)
+before passing for subsequent processing.</p>
+
+<h2>Building</h2>
+
+<p>Code is written using <a href="https://www.gnu.org/software/binutils/">GNU Assembler</a> for AVR.
+To build it you need <code>avr-gcc</code> or <code>avr-binutils</code> to be installed. On a Unix-like system run</p>
+
+<pre><code>./build theremin
+</code></pre>
+
+<p>You should get <code>theremin.bin</code> file, which has to be flashed onto an ATtiny85.</p>
+
+<p>Low fuse byte must be programmed to: <code>11100001</code> (16 MHz clock from PLL).</p>
+
+<h2>Tuning and debugging</h2>
+
+<p>Every instrument is different and has to be tuned before playing.
+For the Tiny Theremin it is not so simple.</p>
+
+<p><img src="img/debug.png" style="width:100%; max-width:1200px;"></p>
+
+<p>You must have some SPI on your PC to connect to an ATtiny85 and
+to read ADC data it sends. For this purpose a special piece of code
+is used. The program is intended only for debugging and tuning.
+To build it run</p>
+
+<pre><code>./build tune_spi
+</code></pre>
+
+<p>You should get <code>tune_spi.bin</code> file, which has to be flashed onto an ATtiny85.</p>
+
+<p>After flashing, with each byte read from an MCU you will alternately
+get an averaged ADC value from each of two antennas. A simple console
+Python script for displaying the data is provided.</p>
+
+<p>Take a look at another files in the <code>scripts</code> folder as well as the
+assembler sources.</p>
+
+<p><br></p>

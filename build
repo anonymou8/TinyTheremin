@@ -1,0 +1,7 @@
+#!/usr/bin/bash
+
+SOURCE=$1
+
+avr-as -mmcu=attiny85 -o $SOURCE.o $SOURCE.avr &&
+avr-ld -o $SOURCE.elf $SOURCE.o &&
+avr-objcopy -j .text -j .data -O binary $SOURCE.elf $SOURCE.bin
