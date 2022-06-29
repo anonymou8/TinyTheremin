@@ -21,11 +21,11 @@ Here's the connection diagram:
 For those, who are brave enough to hear me playing it
 (real guitar as an accompaniment plus some reverb):
 
-<audio controls><source src="audio/ryabina.mp3" type="audio/mpeg"></audio>
+[audio/ryabina.mp3](https://github.com/anonymou8/TinyTheremin/blob/main/audio/ryabina.mp3)
 
 Clean full range record:
 
-<audio controls><source src="audio/clean.mp3" type="audio/mpeg"></audio>
+[audio/clean.mp3](https://github.com/anonymou8/TinyTheremin/blob/main/audio/clean.mp3)
 
 How it works
 ------------
